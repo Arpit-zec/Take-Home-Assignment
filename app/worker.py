@@ -115,7 +115,7 @@ class Worker:
         duration = (
             random.uniform(10, 20) if stage == "processing" else random.uniform(5, 15)
         )
-        if self.stop.wait(duration * self.settings.simulation_speed):
+        if self.stop.wait(duration * self.settings.simulation_scale):
             return True  # Lease expiry makes interrupted work claimable again.
         failed = random.random() < self.settings.failure_probability
         fields: Record = {
@@ -170,7 +170,8 @@ class Worker:
                 return_document=ReturnDocument.AFTER,
             )
             if updated:
-                self.storage.refresh_count(document["user_id"])
+                if updated["status"] not in ACTIVE:
+                    self.storage.adjust_count(document["user_id"], -1)
                 if updated["status"] == "completed":
                     self.storage.cache_result(updated)
                 logger.info(

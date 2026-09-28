@@ -17,7 +17,7 @@ def storage():
         mongo_url=os.getenv("TEST_MONGO_URL", "mongodb://localhost:27018"),
         mongo_database=f"test_insights_{uuid4().hex}",
         redis_url=os.getenv("TEST_REDIS_URL", "redis://localhost:6380/15"),
-        simulation_speed=0,
+        simulation_scale=0,
         failure_probability=0,
     )
     store = Storage(settings)

@@ -5,7 +5,6 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, cast
 
-from fastapi import HTTPException
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.collection import Collection
 from redis import Redis
@@ -14,6 +13,8 @@ from redis.exceptions import RedisError
 from app.config import Settings
 
 ACTIVE = ["queued", "processing", "enriching"]
+MAX_ACTIVE = 3
+COUNT_TTL = 120
 logger = logging.getLogger(__name__)
 Record = dict[str, Any]
 
@@ -77,23 +78,33 @@ class Storage:
             yield
 
     def refresh_count(self, user_id: str) -> int:
+        # Rebuild from the durable records after an eviction or a Redis restart.
         count = self.documents.count_documents(
             {"user_id": user_id, "status": {"$in": ACTIVE}}
         )
-        self.redis.set(f"active:{user_id}", count, ex=120)
+        self.redis.set(f"active:{user_id}", count, ex=COUNT_TTL)
         return count
 
-    def check_capacity(self, user_id: str) -> int:
-        # Rebuild under the user lock: crashes/Redis restarts cannot leak a slot.
-        self.refresh_count(user_id)
-        count = int(cast(str | None, self.redis.get(f"active:{user_id}")) or 0)
-        if count >= 3:
-            raise HTTPException(
-                429,
-                "At most 3 active documents per user",
-                headers={"Retry-After": "10"},
-            )
+    def active_count(self, user_id: str) -> int:
+        value = cast(str | None, self.redis.get(f"active:{user_id}"))
+        if value is None:
+            return self.refresh_count(user_id)
+        return max(0, int(value))
 
+    def adjust_count(self, user_id: str, delta: int) -> None:
+        # Callers hold the per-user lock, so these stay ordered. The TTL bounds
+        # any drift left by a crash between the Mongo write and this update.
+        pipeline = self.redis.pipeline()
+        pipeline.incrby(f"active:{user_id}", delta)
+        pipeline.expire(f"active:{user_id}", COUNT_TTL)
+        pipeline.execute()
+
+    def next_slot(self, user_id: str) -> int | None:
+        # One Redis read turns away a user who is already full, so a merchant
+        # spamming submits never reaches MongoDB. The unique (user_id,
+        # active_slot) index is what actually enforces the limit.
+        if self.active_count(user_id) >= MAX_ACTIVE:
+            return None
         occupied = {
             document["active_slot"]
             for document in self.documents.find(
@@ -101,10 +112,11 @@ class Storage:
                 {"active_slot": 1},
             )
         }
-        for slot in range(3):
+        for slot in range(MAX_ACTIVE):
             if slot not in occupied:
                 return slot
-        raise HTTPException(429, "At most 3 active documents per user")
+        self.refresh_count(user_id)  # Counter ran behind; resync from MongoDB.
+        return None
 
     def cached(self, user_id: str, digest: str) -> Record | None:
         try:

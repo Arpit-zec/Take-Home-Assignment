@@ -289,7 +289,7 @@ def test_database_guard_survives_lost_redis_lock(storage, user):
     # Force all requests to choose slot zero, as if their locks were lost.
     with (
         patch.object(storage, "user_lock", return_value=nullcontext()),
-        patch.object(storage, "check_capacity", return_value=0),
+        patch.object(storage, "next_slot", return_value=0),
     ):
         with ThreadPoolExecutor(max_workers=6) as pool:
             results = list(pool.map(create, range(6)))
@@ -371,3 +371,33 @@ def test_enrichment_racing_patch_cannot_publish_old_tags(storage, user, submit):
     doc = service.get(doc_id, user)
     assert doc["version"] == 2
     assert doc["summary"] is None and doc["tags"] is None
+
+
+def test_patch_without_expected_version_uses_current(client, storage, user, submit):
+    doc_id = submit().json()["document_id"]
+    headers = {"X-User-Id": user}
+    response = client.patch(
+        f"/documents/{doc_id}", headers=headers, json={"content": "Leather tote bag"}
+    )
+    assert response.status_code == 200
+    assert response.json()["version"] == 2
+    assert response.json()["summary"] is None
+    # Reprocessing an already active document must not take a second slot.
+    assert int(storage.redis.get(f"active:{user}")) == 1
+    # Supplying a stale version is still fenced.
+    stale = client.patch(
+        f"/documents/{doc_id}",
+        headers=headers,
+        json={"content": "Canvas tote bag", "expected_version": 1},
+    )
+    assert stale.status_code == 409
+
+
+def test_redis_counter_is_the_admission_gate(storage, user, submit):
+    # No active documents exist in MongoDB; the counter alone rejects the submit.
+    storage.redis.set(f"active:{user}", 3, ex=120)
+    assert submit(content="Blocked by the counter").status_code == 429
+    # Dropping the counter rebuilds it from MongoDB, and admission resumes.
+    storage.redis.delete(f"active:{user}")
+    assert submit(content="Allowed after rebuild").status_code == 201
+    assert int(storage.redis.get(f"active:{user}")) == 1

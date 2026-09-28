@@ -26,7 +26,7 @@ class Submission(BaseModel):
 class ContentUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     content: Content
-    expected_version: int = Field(ge=1)
+    expected_version: int | None = Field(default=None, ge=1)
 
 
 class Stage(BaseModel):

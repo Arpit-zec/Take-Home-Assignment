@@ -55,10 +55,12 @@ curl -X PATCH http://localhost:8000/documents/DOCUMENT_ID \
   -d '{"content":"Waterproof trail shoes with reinforced toe protection.","expected_version":1}'
 ```
 
+`expected_version` is optional. Send it to get a 409 when someone else updated the document first; omit it to accept last-writer-wins against whatever version is current.
+
 | Endpoint | Behavior |
 | --- | --- |
 | `POST /documents` | 201 for a new document; 200 for an identical external-ref retry |
-| `PATCH /documents/{id}` | 200; always restarts both stages; requires `expected_version` |
+| `PATCH /documents/{id}` | 200; always restarts both stages; optional `expected_version` |
 | `GET /documents/{id}` | Current content, stage progress, and versioned results |
 | `GET /users/{user_id}/documents` | Newest first; page ≥ 1; page size 1–100; optional status |
 | `GET /documents/by-ref/{ref}` | Indexed lookup, scoped to the owner |
@@ -82,7 +84,7 @@ Workers atomically claim one document with a random lease token and a 90-second 
 
 Each document stores its content, SHA-256 hash, integer `version`, both stage records, and optional `summary`/`tags`. Each derived field carries **both** its producing version and content hash.
 
-PATCH uses a single atomic MongoDB update matching `expected_version`. It increments the version, replaces the content/hash, clears both derived fields, resets both stages, and invalidates the worker lease together. Two PATCHes expecting version 1 cannot both succeed; the loser gets 409.
+PATCH uses a single atomic MongoDB update matching the expected version: the value the caller sent, or the current version read under the per-user lock when it is omitted. It increments the version, replaces the content/hash, clears both derived fields, resets both stages, and invalidates the worker lease together. Two PATCHes expecting version 1 cannot both succeed; the loser gets 409. Two PATCHes that omit the field serialize on the lock and produce versions 2 and 3, never a merged document.
 
 Stage writes match `_id + version + lease_token`. A version-1 worker finishing after a version-2 PATCH matches nothing. Reads obtain one MongoDB document snapshot and expose a derived field only when its version/hash match the current content. Tags are also hidden without a matching summary. Therefore a reader sees the old snapshot before PATCH, or the new snapshot after it, never a combination of their fields. A current partial summary can appear during enrichment, but `result_current` becomes true only when both results are complete. Old results are removed rather than displayed as stale.
 
@@ -92,7 +94,7 @@ Stage writes match `_id + version + lease_token`. A version-1 worker finishing a
 
 **Caching:** `insights:v1:{user_id}:{sha256(content)}` stores only completed results for 24 hours. The `v1` namespace identifies the mock algorithm. Cache hits create a completed document immediately and do not consume capacity. Results are rebound to the new document's version. PATCH always reprocesses; the old hash's cache remains valid for that old content. Whitespace at the edges is trimmed; internal whitespace and case remain significant. Cache errors are logged and treated as misses.
 
-**Capacity:** Redis tracks `active:{user_id}` across queued, processing, enriching, and retry backoff. Admission and terminal transitions use a per-user Redis lock. Counts have a 120-second TTL and are reconciled from MongoDB while holding the lock, so a crash between the database write and counter update does not permanently leak capacity. The lock expires after 60 seconds; database calls time out after five seconds, and no simulated work runs inside the lock.
+**Capacity:** Redis holds `active:{user_id}`, counting queued, processing, enriching, and retry backoff. It is the admission gate, not a mirror of MongoDB: a merchant already at three is rejected on a single Redis read, with no database query at all, which is what keeps a submit flood cheap. Admission and terminal transitions apply `INCRBY` under a per-user Redis lock. The counter carries a 120-second TTL and is rebuilt from MongoDB only when it is missing, so an eviction or a Redis restart cannot permanently leak capacity. The lock expires after 60 seconds; database calls time out after five seconds, and no simulated work runs inside the lock.
 
 As a small durability safeguard, active documents also occupy slot 0, 1, or 2, with a unique MongoDB `(user_id, active_slot)` index. Completion/failure atomically removes the slot. Even if Redis restarts or a process outlives its lock, concurrent admissions cannot create a fourth slot. A slot collision returns 429 and can be retried. Redis outages fail writes closed with 503; reads still work, and workers resume after recovery. Redis uses AOF and `noeviction`.
 
@@ -124,7 +126,7 @@ A merchant with 500K documents creates a large contiguous range in the user-lead
 
 For horizontal document storage, I would use `(user_id, bucket)`, where `bucket` is a stable hash of the document ID modulo a fixed bucket count. This distributes a large merchant across partitions; plain `user_id`, including hashed `user_id`, leaves all of that merchant's records together. The tradeoff is that user-wide lists must query several buckets and merge their ordered results. Point reads can derive the bucket from the document ID. A global external-reference constraint would move into a separate crosswalk collection partitioned by hashed reference, with a unique reference index and an explicit transactional or reservation protocol. The current global unique index cannot simply be carried over to an unrelated MongoDB shard key. The three active slots would similarly move to a small admission collection whose partition key includes the merchant, preserving the per-user uniqueness invariant.
 
-At 100× submit QPS, the current Redis user lock plus MongoDB recount adds round trips and serializes bursts for one merchant. Redis counters themselves are inexpensive, but each admission currently does more than increment one key. I would use an atomic Lua reservation keyed by merchant with idempotent job tokens, and reconcile reservations through a durable outbox. Redis Cluster keys participating in one script need the same hash tag. The three-job policy means a busy merchant should be rejected quickly rather than generate a lock queue. Cross-store failure handling and reservation expiry would need fault-injection tests before replacing the current database safeguard.
+At 100× submit QPS, the counter itself holds up: a rejection costs one Redis `GET` and never reaches MongoDB, and an admission adds one `INCRBY`. The per-user lock is the real bottleneck, since every admitted submit takes and releases it around a MongoDB write, so one merchant's burst serializes into a lock queue even though the policy allows only three jobs. The `GET`, the slot read, and the `INCRBY` are also separate round trips, so the counter can disagree with MongoDB in the window between them. I would collapse admission into one atomic Lua reservation keyed by merchant with idempotent job tokens, dropping the lock entirely, and reconcile reservations through a durable outbox. Redis Cluster keys participating in one script need the same hash tag. The three-job policy means a busy merchant should be rejected quickly rather than generate a lock queue. Cross-store failure handling and reservation expiry would need fault-injection tests before replacing the current database safeguard.
 
 Finally, skip/limit scans and discards the offset, so page 40,000 is inherently costly. I would offer cursor pagination using `(created_at, _id)` as the stable descending boundary, with the user and filter encoded in a signed cursor. Each bucket returns only the next bounded page. New inserts would no longer shift previously traversed offsets. Exact totals would become optional, and worker queue lag, admission latency, and cache hit rate would guide scaling decisions.
 

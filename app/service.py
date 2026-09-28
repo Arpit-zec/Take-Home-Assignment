@@ -7,7 +7,7 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from app.models import ContentUpdate, DocumentView, Stage, Submission
-from app.storage import ACTIVE, Record, Storage, content_hash
+from app.storage import ACTIVE, MAX_ACTIVE, Record, Storage, content_hash
 
 
 def utcnow() -> datetime:
@@ -75,6 +75,16 @@ class DocumentService:
         self.storage = storage
         self.documents = storage.documents
 
+    def claim_slot(self, user_id: str) -> int:
+        slot = self.storage.next_slot(user_id)
+        if slot is None:
+            raise HTTPException(
+                429,
+                f"At most {MAX_ACTIVE} active documents per user",
+                headers={"Retry-After": "10"},
+            )
+        return slot
+
     def get(self, document_id: str, user_id: str) -> Record:
         document = self.documents.find_one(
             {"_id": object_id(document_id), "user_id": user_id}
@@ -111,7 +121,7 @@ class DocumentService:
             cached = self.storage.cached(
                 submission.user_id, content_hash(submission.content)
             )
-            slot = None if cached else self.storage.check_capacity(submission.user_id)
+            slot = None if cached else self.claim_slot(submission.user_id)
             document = {
                 "_id": ObjectId(),
                 "user_id": submission.user_id,
@@ -135,24 +145,32 @@ class DocumentService:
                 raise HTTPException(
                     429, "Active capacity changed; retry shortly"
                 ) from None
-            self.storage.refresh_count(submission.user_id)
+            if slot is not None:
+                self.storage.adjust_count(submission.user_id, 1)
             return document, True
 
     def update(self, document_id: str, user_id: str, update: ContentUpdate) -> Record:
         with self.storage.user_lock(user_id):
             old = self.get(document_id, user_id)
-            if old["version"] != update.expected_version:
+            # Omitting expected_version opts into last-writer-wins; the per-user
+            # lock still serializes concurrent updates into separate versions.
+            expected = (
+                old["version"]
+                if update.expected_version is None
+                else update.expected_version
+            )
+            if old["version"] != expected:
                 raise HTTPException(409, "Version changed; reload before updating")
             # PATCH always runs both stages, even when the content is cached.
-            fields = pipeline_fields(update.content, update.expected_version + 1)
-            fields["active_slot"] = (
-                old["active_slot"]
-                if old["status"] in ACTIVE
-                else self.storage.check_capacity(user_id)
-            )
+            fields = pipeline_fields(update.content, expected + 1)
+            slot = old.get("active_slot") if old["status"] in ACTIVE else None
+            reactivating = slot is None
+            if reactivating:
+                slot = self.claim_slot(user_id)
+            fields["active_slot"] = slot
             try:
                 document = self.documents.find_one_and_update(
-                    {"_id": old["_id"], "version": update.expected_version},
+                    {"_id": old["_id"], "version": expected},
                     {"$set": fields},
                     return_document=ReturnDocument.AFTER,
                 )
@@ -162,7 +180,8 @@ class DocumentService:
                 ) from None
             if document is None:
                 raise HTTPException(409, "Version changed; reload before updating")
-            self.storage.refresh_count(user_id)
+            if reactivating:
+                self.storage.adjust_count(user_id, 1)
             return document
 
     def list(
