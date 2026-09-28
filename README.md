@@ -31,6 +31,14 @@ python -m app.worker
 
 If the full Compose stack is already running, stop its API and worker before starting local versions: `docker compose stop api worker`.
 
+## Run in GitHub Codespaces
+
+`.devcontainer/devcontainer.json` boots this same Compose stack on a Codespace, so the API can be reached without installing anything locally. On GitHub choose **Code → Codespaces → Create codespace**, wait for the stack to start, then open the **Ports** tab: port 8000 carries a `*.app.github.dev` URL, and `/docs` on it serves the API browser.
+
+That port is forwarded as **public**, so anyone holding the URL can call the API. Since `X-User-Id` is a trusted header, a public port lets any caller read any merchant's documents by guessing an id. Keep the data disposable, or switch the port back to private in the Ports tab (`visibility` in `devcontainer.json`) and use the authenticated preview instead. Organisation policy may block public ports outright.
+
+A Codespace stops once idle and runs Compose again on restart. MongoDB and Redis bind to the Codespace's own loopback interface; only port 8000 is published.
+
 ## Try it
 
 `X-User-Id` represents the authenticated merchant in this POC. The body `user_id` must match it. This is a trusted identity stub, **not production authentication**: deploy behind a gateway that validates tokens and sets this identity, or replace the dependency with JWT verification. A partner must use the submitting merchant's identity too.

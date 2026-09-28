@@ -1,0 +1,26 @@
+{
+  "name": "Cohort Insights API",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "postCreateCommand": "pip install -e '.[dev]'",
+  "postStartCommand": "docker compose up --build -d",
+  "forwardPorts": [8000],
+  "portsAttributes": {
+    "8000": {
+      "label": "Cohort Insights API",
+      "visibility": "public",
+      "onAutoForward": "notify"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.black-formatter",
+        "charliermarsh.ruff"
+      ]
+    }
+  }
+}
