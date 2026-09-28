@@ -1,0 +1,57 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment: &environment
+      MONGO_URL: mongodb://mongo:27017
+      MONGO_DATABASE: ecommerce_insights
+      REDIS_URL: redis://redis:6379/0
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-86400}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      FAILURE_PROBABILITY: ${FAILURE_PROBABILITY:-0.1}
+      SIMULATION_SPEED: ${SIMULATION_SPEED:-1}
+      MAX_STAGE_ATTEMPTS: ${MAX_STAGE_ATTEMPTS:-3}
+    depends_on: &dependencies
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    environment: *environment
+    depends_on: *dependencies
+    restart: unless-stopped
+  mongo:
+    image: mongo:7.0
+    ports:
+      - "127.0.0.1:${MONGO_PORT:-27018}:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6380}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+volumes:
+  mongo_data:
+  redis_data:
